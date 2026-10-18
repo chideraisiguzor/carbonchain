@@ -13,9 +13,11 @@ import type {
   Webhook,
   WebhookDelivery,
   WebhookRegistrationResult,
+  WebhookMetrics,
 } from './webhooks.service';
 import { WebhooksService } from './webhooks.service';
 import { WebhookIpAllowlistGuard } from './webhook-ip-allowlist.guard';
+import { AdminGuard } from '../auth/admin.guard';
 import {
   WebhookJanitorService,
   JanitorStats,
@@ -66,6 +68,25 @@ export class WebhooksController {
   @Get()
   async getWebhooks(): Promise<Webhook[]> {
     return this.webhooksService.getWebhooks();
+  }
+
+  /**
+   * #1184 — Aggregated webhook metrics for dashboards.
+   *
+   * Admin-only.  Must be declared before the `:id` route so that the literal
+   * `metrics` path is not captured as a webhook ID.
+   */
+  @ApiOperation({ summary: 'Get aggregated webhook metrics (admin only)' })
+  @ApiResponse({ status: 200, description: 'Aggregated webhook metrics' })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized or client IP not in allowlist',
+  })
+  @ApiResponse({ status: 403, description: 'Admin access required' })
+  @UseGuards(AdminGuard)
+  @Get('metrics')
+  async getWebhookMetrics(): Promise<WebhookMetrics> {
+    return this.webhooksService.getWebhookMetrics();
   }
 
   @ApiOperation({ summary: 'Get webhook by ID' })

@@ -17,6 +17,7 @@ const mockWebhooksService = {
   getWebhook: jest.fn(),
   deleteWebhook: jest.fn(),
   validateWebhookUrl: jest.fn().mockResolvedValue(undefined),
+  getWebhookMetrics: jest.fn(),
 };
 
 describe('WebhooksController', () => {
@@ -100,6 +101,43 @@ describe('WebhooksController', () => {
       await expect(controller.getWebhook('nonexistent')).rejects.toThrow(
         NotFoundException,
       );
+    });
+  });
+
+  describe('getWebhookMetrics', () => {
+    it('returns aggregated webhook metrics from the service', async () => {
+      const metrics = {
+        totalWebhooks: 3,
+        activeWebhooks: 2,
+        inactiveWebhooks: 1,
+        totalDeliveries: 10,
+        successfulDeliveries: 7,
+        failedDeliveries: 2,
+        pendingDeliveries: 1,
+        averageDeliveryLatencyMs: 123.45,
+        failureRateByEventType: {
+          credit_submitted: 0.2,
+          credit_approved: 0,
+        },
+        topFailingWebhooks: [
+          { id: 'webhook_1', url: 'https://a.com', failureCount: 2 },
+        ],
+      };
+      mockWebhooksService.getWebhookMetrics.mockResolvedValueOnce(metrics);
+
+      const result = await controller.getWebhookMetrics();
+
+      expect(mockWebhooksService.getWebhookMetrics).toHaveBeenCalledTimes(1);
+      expect(result).toEqual(metrics);
+    });
+
+    it('is guarded by admin-only access', () => {
+      const guards = Reflect.getMetadata(
+        '__guards__',
+        controller.getWebhookMetrics,
+      );
+      expect(guards).toBeDefined();
+      expect(guards.length).toBeGreaterThan(0);
     });
   });
 

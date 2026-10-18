@@ -155,6 +155,74 @@ function buildMockDataSource() {
       return webhookId ? all.filter((d) => d.webhook_id === webhookId) : all;
     }
 
+    // SELECT aggregated delivery metrics (getWebhookMetrics)
+    if (
+      s.includes('FROM webhook_deliveries') &&
+      (s.includes('COUNT(') || s.includes('AVG(') || s.includes('GROUP BY'))
+    ) {
+      const all = Object.values(deliveries);
+      const byStatus = (status: string) =>
+        all.filter((d) => d.status === status).length;
+      const succeeded = all.filter((d) => d.status === 'success');
+      const latencies = succeeded
+        .map((d) =>
+          d.last_attempt_at
+            ? d.last_attempt_at.getTime() - d.created_at.getTime()
+            : null,
+        )
+        .filter((v): v is number => v !== null);
+      const avgLatency = latencies.length
+        ? latencies.reduce((a, b) => a + b, 0) / latencies.length
+        : 0;
+
+      if (s.includes('GROUP BY') && s.includes('event_type')) {
+        const groups: Record<string, { total: number; failed: number }> = {};
+        for (const d of all) {
+          groups[d.event_type] = groups[d.event_type] ?? {
+            total: 0,
+            failed: 0,
+          };
+          groups[d.event_type].total += 1;
+          if (d.status === 'failed') groups[d.event_type].failed += 1;
+        }
+        return Object.entries(groups).map(([event_type, g]) => ({
+          event_type,
+          total: g.total,
+          failed: g.failed,
+        }));
+      }
+
+      if (s.includes('GROUP BY') && s.includes('webhook_id')) {
+        const groups: Record<string, { total: number; failed: number }> = {};
+        for (const d of all) {
+          groups[d.webhook_id] = groups[d.webhook_id] ?? {
+            total: 0,
+            failed: 0,
+          };
+          groups[d.webhook_id].total += 1;
+          if (d.status === 'failed') groups[d.webhook_id].failed += 1;
+        }
+        return Object.entries(groups)
+          .map(([webhook_id, g]) => ({
+            webhook_id,
+            url: webhooks[webhook_id]?.url ?? null,
+            total: g.total,
+            failed: g.failed,
+          }))
+          .sort((a, b) => b.failed - a.failed);
+      }
+
+      return [
+        {
+          total: all.length,
+          success: byStatus('success'),
+          failed: byStatus('failed'),
+          pending: byStatus('pending'),
+          avg_latency_ms: avgLatency,
+        },
+      ];
+    }
+
     // UPDATE delivery status
     if (s.startsWith('UPDATE webhook_deliveries')) {
       const id = (params as string[])[0];
@@ -474,6 +542,210 @@ describe('WebhooksService', () => {
       const wrongSecret = `sha256=${createHmac('sha256', 'wrong-secret').update(signingInput).digest('hex')}`;
 
       expect(sigHeader).not.toBe(wrongSecret);
+    });
+  });
+
+  // ── #1184 — Webhook metrics ─────────────────────────────────────────────────
+
+  describe('#1184 getWebhookMetrics', () => {
+    it('returns zeroed metrics when there is no data', async () => {
+      const metrics = await service.getWebhookMetrics();
+
+      expect(metrics.totalWebhooks).toBe(0);
+      expect(metrics.activeWebhooks).toBe(0);
+      expect(metrics.inactiveWebhooks).toBe(0);
+      expect(metrics.totalDeliveries).toBe(0);
+      expect(metrics.successfulDeliveries).toBe(0);
+      expect(metrics.failedDeliveries).toBe(0);
+      expect(metrics.pendingDeliveries).toBe(0);
+      expect(metrics.averageLatencyMs).toBe(0);
+      expect(metrics.failureRateByEventType).toEqual([]);
+      expect(metrics.topFailingWebhooks).toEqual([]);
+    });
+
+    it('counts total, active and inactive webhooks', async () => {
+      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+
+      const wh1 = await service.registerWebhook('https://example.com/a', [
+        'credit_submitted',
+      ]);
+      await service.registerWebhook('https://example.com/b', [
+        'credit_submitted',
+      ]);
+
+      // Deactivate one webhook directly in the fake store.
+      mockDs._store.webhooks[wh1.id].active = false;
+
+      const metrics = await service.getWebhookMetrics();
+
+      expect(metrics.totalWebhooks).toBe(2);
+      expect(metrics.activeWebhooks).toBe(1);
+      expect(metrics.inactiveWebhooks).toBe(1);
+    });
+
+    it('aggregates delivery counts by status', async () => {
+      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+
+      const wh = await service.registerWebhook('https://example.com/hook', [
+        'credit_submitted',
+      ]);
+
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-2' });
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-3' });
+
+      const ids = Object.keys(mockDs._store.deliveries);
+      mockDs._store.deliveries[ids[0]].status = 'success';
+      mockDs._store.deliveries[ids[1]].status = 'failed';
+      // ids[2] stays pending
+
+      const metrics = await service.getWebhookMetrics();
+
+      expect(metrics.totalDeliveries).toBe(3);
+      expect(metrics.successfulDeliveries).toBe(1);
+      expect(metrics.failedDeliveries).toBe(1);
+      expect(metrics.pendingDeliveries).toBe(1);
+      expect(wh.id).toBeDefined();
+    });
+
+    it('computes average delivery latency from successful deliveries', async () => {
+      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+
+      await service.registerWebhook('https://example.com/hook', [
+        'credit_submitted',
+      ]);
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-2' });
+
+      const ids = Object.keys(mockDs._store.deliveries);
+      const base = Date.now();
+      mockDs._store.deliveries[ids[0]].status = 'success';
+      mockDs._store.deliveries[ids[0]].created_at = new Date(base);
+      mockDs._store.deliveries[ids[0]].last_attempt_at = new Date(base + 100);
+      mockDs._store.deliveries[ids[1]].status = 'success';
+      mockDs._store.deliveries[ids[1]].created_at = new Date(base);
+      mockDs._store.deliveries[ids[1]].last_attempt_at = new Date(base + 300);
+
+      const metrics = await service.getWebhookMetrics();
+
+      expect(metrics.averageLatencyMs).toBe(200);
+    });
+
+    it('computes failure rate by event type', async () => {
+      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+
+      await service.registerWebhook('https://example.com/hook', [
+        'credit_submitted',
+        'credit_approved',
+      ]);
+
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-2' });
+      await service.triggerWebhooks('credit_approved', { id: 'evt-3' });
+
+      const ids = Object.keys(mockDs._store.deliveries);
+      mockDs._store.deliveries[ids[0]].status = 'failed';
+      mockDs._store.deliveries[ids[1]].status = 'success';
+      mockDs._store.deliveries[ids[2]].status = 'failed';
+
+      const metrics = await service.getWebhookMetrics();
+
+      const submitted = metrics.failureRateByEventType.find(
+        (e) => e.eventType === 'credit_submitted',
+      );
+      const approved = metrics.failureRateByEventType.find(
+        (e) => e.eventType === 'credit_approved',
+      );
+
+      expect(submitted).toBeDefined();
+      expect(submitted!.total).toBe(2);
+      expect(submitted!.failed).toBe(1);
+      expect(submitted!.failureRate).toBeCloseTo(0.5);
+
+      expect(approved).toBeDefined();
+      expect(approved!.total).toBe(1);
+      expect(approved!.failed).toBe(1);
+      expect(approved!.failureRate).toBeCloseTo(1);
+    });
+
+    it('returns top failing webhooks ordered by failure count', async () => {
+      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+
+      const whA = await service.registerWebhook('https://example.com/a', [
+        'credit_submitted',
+      ]);
+      const whB = await service.registerWebhook('https://example.com/b', [
+        'credit_submitted',
+      ]);
+
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-2' });
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-3' });
+
+      const ids = Object.keys(mockDs._store.deliveries);
+      // whA fails twice, whB fails once
+      mockDs._store.deliveries[ids[0]].webhook_id = whA.id;
+      mockDs._store.deliveries[ids[0]].status = 'failed';
+      mockDs._store.deliveries[ids[1]].webhook_id = whA.id;
+      mockDs._store.deliveries[ids[1]].status = 'failed';
+      mockDs._store.deliveries[ids[2]].webhook_id = whB.id;
+      mockDs._store.deliveries[ids[2]].status = 'failed';
+
+      const metrics = await service.getWebhookMetrics();
+
+      expect(metrics.topFailingWebhooks.length).toBeGreaterThanOrEqual(2);
+      expect(metrics.topFailingWebhooks[0].webhookId).toBe(whA.id);
+      expect(metrics.topFailingWebhooks[0].failed).toBe(2);
+      expect(metrics.topFailingWebhooks[1].webhookId).toBe(whB.id);
+      expect(metrics.topFailingWebhooks[1].failed).toBe(1);
+    });
+  });
+
+  // ── #1184 — Prometheus delivery metrics ─────────────────────────────────────
+
+  describe('#1184 Prometheus delivery metrics', () => {
+    it('increments success counter on successful delivery', async () => {
+      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+
+      await service.registerWebhook('https://example.com/hook', [
+        'credit_submitted',
+      ]);
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
+
+      const incSpy = jest
+        .spyOn(service as unknown as { recordDeliveryMetric: jest.Mock }, 'recordDeliveryMetric')
+        .mockImplementation(() => undefined);
+
+      mockedAxios.post = jest.fn().mockResolvedValue({ status: 200 });
+      await service.processQueue();
+
+      expect(incSpy).toHaveBeenCalledWith(
+        'credit_submitted',
+        'success',
+        expect.any(Number),
+      );
+    });
+
+    it('increments failure counter on failed delivery', async () => {
+      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+
+      await service.registerWebhook('https://example.com/hook', [
+        'credit_submitted',
+      ]);
+      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
+
+      const incSpy = jest
+        .spyOn(service as unknown as { recordDeliveryMetric: jest.Mock }, 'recordDeliveryMetric')
+        .mockImplementation(() => undefined);
+
+      mockedAxios.post = jest.fn().mockRejectedValue(new Error('boom'));
+      await service.processQueue();
+
+      expect(incSpy).toHaveBeenCalledWith(
+        'credit_submitted',
+        'failed',
+        expect.any(Number),
+      );
     });
   });
 

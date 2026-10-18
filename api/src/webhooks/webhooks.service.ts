@@ -13,8 +13,32 @@ import { lookup as dnsLookup } from 'dns';
 import { promisify } from 'util';
 import axios, { AxiosError } from 'axios';
 import ipRangeCheck from 'ip-range-check';
+import { Counter, Histogram, register } from 'prom-client';
 
 const dnsLookupAsync = promisify(dnsLookup);
+
+// ── Prometheus metrics (#1184) ────────────────────────────────────────────────
+
+const webhookDeliveriesTotal = new Counter({
+  name: 'webhook_deliveries_total',
+  help: 'Total number of webhook delivery attempts',
+  labelNames: ['status', 'event_type'] as const,
+});
+
+const webhookDeliveryDuration = new Histogram({
+  name: 'webhook_delivery_duration_seconds',
+  help: 'Duration of webhook delivery attempts in seconds',
+  labelNames: ['status', 'event_type'] as const,
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
+
+// Register once; guard against duplicate registration in test environments.
+try {
+  register.registerMetric(webhookDeliveriesTotal);
+  register.registerMetric(webhookDeliveryDuration);
+} catch {
+  // Already registered (e.g. module re-imported in tests) — ignore.
+}
 
 // ── Private IP ranges to block (SSRF protection #912) ────────────────────────
 // Covers loopback, link-local, RFC-1918 private, CGNAT, and cloud metadata.
@@ -66,6 +90,33 @@ export interface WebhookDelivery {
   createdAt: Date;
   lastAttemptAt?: Date;
   nextRetryAt?: Date;
+}
+
+/** #1184 — aggregated webhook metrics for the admin dashboard. */
+export interface WebhookMetrics {
+  totalWebhooks: number;
+  activeWebhooks: number;
+  inactiveWebhooks: number;
+  totalDeliveries: number;
+  successfulDeliveries: number;
+  failedDeliveries: number;
+  pendingDeliveries: number;
+  /** Average latency (ms) between enqueue and last attempt for completed deliveries. */
+  averageDeliveryLatencyMs: number;
+  /** Failure rate (0..1) grouped by event type. */
+  failureRateByEventType: {
+    eventType: string;
+    total: number;
+    failed: number;
+    failureRate: number;
+  }[];
+  /** Webhooks with the highest failure counts. */
+  topFailingWebhooks: {
+    id: string;
+    url: string;
+    failureCount: number;
+    active: boolean;
+  }[];
 }
 
 // ── Service ───────────────────────────────────────────────────────────────────
@@ -421,6 +472,16 @@ export class WebhooksService implements OnModuleInit, OnModuleDestroy {
       .update(signingInput)
       .digest('hex');
 
+    const deliveryStart = process.hrtime.bigint();
+    const recordDuration = (status: string): void => {
+      const seconds =
+        Number(process.hrtime.bigint() - deliveryStart) / 1_000_000_000;
+      webhookDeliveryDuration.observe(
+        { status, event_type: row.event_type },
+        seconds,
+      );
+    };
+
     try {
       await axios.post(webhook.url, JSON.parse(rawBody) as unknown, {
         headers: {
@@ -433,6 +494,13 @@ export class WebhooksService implements OnModuleInit, OnModuleDestroy {
         },
         timeout: 10_000,
       });
+
+      // #1184 — Prometheus metrics
+      webhookDeliveriesTotal.inc({
+        status: 'success',
+        event_type: row.event_type,
+      });
+      recordDuration('success');
 
       // Success
       await this.dataSource.query(
@@ -456,6 +524,13 @@ export class WebhooksService implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       const axiosError = error as AxiosError;
       const newFailureCount = webhook.failure_count + 1;
+
+      // #1184 — Prometheus metrics (failed attempt; may still be retried)
+      webhookDeliveriesTotal.inc({
+        status: 'failed',
+        event_type: row.event_type,
+      });
+      recordDuration('failed');
 
       if (attemptNumber < this.MAX_RETRIES) {
         const backoffMs =
@@ -538,6 +613,113 @@ export class WebhooksService implements OnModuleInit, OnModuleDestroy {
       lastAttemptAt: r.last_attempt_at ?? undefined,
       nextRetryAt: r.next_retry_at ?? undefined,
     }));
+  }
+
+  /**
+   * #1184 — Aggregate webhook metrics for the admin dashboard.
+   *
+   * Returns webhook counts, delivery status breakdown, average delivery
+   * latency, failure rate by event type, and the top failing webhooks.
+   */
+  async getWebhookMetrics(): Promise<WebhookMetrics> {
+    // Webhook counts.
+    const webhookCountRows = await this.dataSource.query<
+      { total: string; active: string }[]
+    >(
+      `SELECT COUNT(*)::text AS total,
+              COUNT(*) FILTER (WHERE active = TRUE)::text AS active
+         FROM webhooks`,
+    );
+    const totalWebhooks = Number(webhookCountRows[0]?.total ?? 0);
+    const activeWebhooks = Number(webhookCountRows[0]?.active ?? 0);
+
+    // Delivery status breakdown.
+    const deliveryCountRows = await this.dataSource.query<
+      { status: string; count: string }[]
+    >(
+      `SELECT status, COUNT(*)::text AS count
+         FROM webhook_deliveries
+        GROUP BY status`,
+    );
+    let successfulDeliveries = 0;
+    let failedDeliveries = 0;
+    let pendingDeliveries = 0;
+    for (const r of deliveryCountRows) {
+      const count = Number(r.count);
+      if (r.status === 'success') successfulDeliveries = count;
+      else if (r.status === 'failed') failedDeliveries = count;
+      else if (r.status === 'pending') pendingDeliveries = count;
+    }
+    const totalDeliveries =
+      successfulDeliveries + failedDeliveries + pendingDeliveries;
+
+    // Average delivery latency (ms) for completed deliveries.
+    const latencyRows = await this.dataSource.query<
+      { avg_ms: string | null }[]
+    >(
+      `SELECT AVG(EXTRACT(EPOCH FROM (last_attempt_at - created_at)) * 1000)::text AS avg_ms
+         FROM webhook_deliveries
+        WHERE last_attempt_at IS NOT NULL
+          AND status IN ('success', 'failed')`,
+    );
+    const averageDeliveryLatencyMs = Number(latencyRows[0]?.avg_ms ?? 0);
+
+    // Failure rate by event type.
+    const eventTypeRows = await this.dataSource.query<
+      { event_type: string; total: string; failed: string }[]
+    >(
+      `SELECT event_type,
+              COUNT(*)::text AS total,
+              COUNT(*) FILTER (WHERE status = 'failed')::text AS failed
+         FROM webhook_deliveries
+        GROUP BY event_type
+        ORDER BY COUNT(*) DESC`,
+    );
+    const failureRateByEventType = eventTypeRows.map((r) => {
+      const total = Number(r.total);
+      const failed = Number(r.failed);
+      return {
+        eventType: r.event_type,
+        total,
+        failed,
+        failureRate: total > 0 ? failed / total : 0,
+      };
+    });
+
+    // Top failing webhooks.
+    const topFailingRows = await this.dataSource.query<
+      {
+        id: string;
+        url: string;
+        failure_count: number;
+        active: boolean;
+      }[]
+    >(
+      `SELECT id, url, failure_count, active
+         FROM webhooks
+        WHERE failure_count > 0
+        ORDER BY failure_count DESC
+        LIMIT 10`,
+    );
+    const topFailingWebhooks = topFailingRows.map((r) => ({
+      id: r.id,
+      url: r.url,
+      failureCount: r.failure_count,
+      active: r.active,
+    }));
+
+    return {
+      totalWebhooks,
+      activeWebhooks,
+      inactiveWebhooks: totalWebhooks - activeWebhooks,
+      totalDeliveries,
+      successfulDeliveries,
+      failedDeliveries,
+      pendingDeliveries,
+      averageDeliveryLatencyMs,
+      failureRateByEventType,
+      topFailingWebhooks,
+    };
   }
 
   /**

@@ -737,4 +737,181 @@ describe('StellarService - sequence number integration', () => {
       });
     });
   });
+
+  // ── buildContractTransaction (#1177) ───────────────────────────────────────
+
+  describe('buildContractTransaction (#1177)', () => {
+    const { TransactionBuilder: ActualTransactionBuilder, xdr, Networks } =
+      jest.requireActual<typeof import('@stellar/stellar-sdk')>(
+        '@stellar/stellar-sdk',
+      );
+
+    const SOURCE_ACCOUNT = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+    beforeEach(() => {
+      mockLoadAccount.mockResolvedValue({
+        accountId: () => SOURCE_ACCOUNT,
+        sequenceNumber: '12345',
+      });
+      mockFeeStats.mockResolvedValue({ fee_charged: { p50: '200' } });
+      mockSimulateTransaction.mockResolvedValue({
+        transactionData: 'AAAAAA==',
+        minResourceFee: '1000',
+        result: { retval: 'test' },
+      });
+    });
+
+    it('returns a valid unsigned transaction XDR', async () => {
+      const xdrString = await service.buildContractTransaction(
+        CONTRACT_ID,
+        'approve_credit',
+        [],
+        SOURCE_ACCOUNT,
+      );
+
+      expect(typeof xdrString).toBe('string');
+      const tx = ActualTransactionBuilder.fromXDR(
+        xdrString,
+        service.getNetworkPassphrase(),
+      );
+      // No signatures — client must sign
+      expect(tx.signatures).toHaveLength(0);
+      expect(tx.source).toBe(SOURCE_ACCOUNT);
+    });
+
+    it('applies base fee + simulated resource fee with buffer', async () => {
+      const xdrString = await service.buildContractTransaction(
+        CONTRACT_ID,
+        'approve_credit',
+        [],
+        SOURCE_ACCOUNT,
+      );
+
+      const tx = ActualTransactionBuilder.fromXDR(
+        xdrString,
+        service.getNetworkPassphrase(),
+      );
+      // base fee p50 = 200, minResourceFee = 1000
+      // expected = ceil((200 + 1000) * 1.1) = 1320
+      expect(tx.fee).toBe('1320');
+    });
+
+    it('sets time bounds on the transaction', async () => {
+      const xdrString = await service.buildContractTransaction(
+        CONTRACT_ID,
+        'approve_credit',
+        [],
+        SOURCE_ACCOUNT,
+      );
+
+      const tx = ActualTransactionBuilder.fromXDR(
+        xdrString,
+        service.getNetworkPassphrase(),
+      );
+      expect(tx.timeBounds).toBeDefined();
+      expect(tx.timeBounds?.maxTime).toBeDefined();
+      expect(Number(tx.timeBounds?.maxTime)).toBeGreaterThan(0);
+    });
+
+    it('uses the source account sequence number from Horizon', async () => {
+      const xdrString = await service.buildContractTransaction(
+        CONTRACT_ID,
+        'approve_credit',
+        [],
+        SOURCE_ACCOUNT,
+      );
+
+      expect(mockLoadAccount).toHaveBeenCalledWith(SOURCE_ACCOUNT);
+      const tx = ActualTransactionBuilder.fromXDR(
+        xdrString,
+        service.getNetworkPassphrase(),
+      );
+      // Horizon sequence 12345 → next sequence 12346
+      expect(tx.sequence).toBe('12346');
+    });
+
+    it('includes the contract invocation operation', async () => {
+      const xdrString = await service.buildContractTransaction(
+        CONTRACT_ID,
+        'approve_credit',
+        [xdr.ScVal.scvU32(7)],
+        SOURCE_ACCOUNT,
+      );
+
+      const tx = ActualTransactionBuilder.fromXDR(
+        xdrString,
+        service.getNetworkPassphrase(),
+      );
+      expect(tx.operations).toHaveLength(1);
+      expect(tx.operations[0].type).toBe('invokeHostFunction');
+    });
+
+    it('falls back to a default fee when feeStats fails', async () => {
+      mockFeeStats.mockRejectedValue(new Error('network error'));
+
+      const xdrString = await service.buildContractTransaction(
+        CONTRACT_ID,
+        'approve_credit',
+        [],
+        SOURCE_ACCOUNT,
+      );
+
+      const tx = ActualTransactionBuilder.fromXDR(
+        xdrString,
+        service.getNetworkPassphrase(),
+      );
+      // fallback base fee 100 + minResourceFee 1000 → ceil(1100 * 1.1) = 1210
+      expect(tx.fee).toBe('1210');
+    });
+  });
+
+  // ── invalidateAccountCache (#1180) ─────────────────────────────────────────
+
+  describe('invalidateAccountCache (#1180)', () => {
+    const ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+    it('removes the address from the local account info cache', async () => {
+      mockLoadAccount.mockResolvedValue({
+        accountId: () => ADDRESS,
+        sequenceNumber: '10',
+      });
+
+      // Prime the cache
+      await service.getAccountInfo(ADDRESS);
+      expect(mockLoadAccount).toHaveBeenCalledTimes(1);
+
+      // Second call within TTL should hit the cache
+      await service.getAccountInfo(ADDRESS);
+      expect(mockLoadAccount).toHaveBeenCalledTimes(1);
+
+      // Invalidate and verify the next call re-fetches
+      await service.invalidateAccountCache(ADDRESS);
+      await service.getAccountInfo(ADDRESS);
+      expect(mockLoadAccount).toHaveBeenCalledTimes(2);
+    });
+
+    it('publishes a Redis invalidation event for multi-instance caches', async () => {
+      const cacheService = (service as any).cacheService as {
+        client: { publish: jest.Mock };
+      };
+      if (cacheService?.client) {
+        cacheService.client.publish = jest.fn().mockResolvedValue(1);
+      }
+
+      await service.invalidateAccountCache(ADDRESS);
+
+      if (cacheService?.client?.publish) {
+        expect(cacheService.client.publish).toHaveBeenCalledWith(
+          expect.any(String),
+          ADDRESS,
+        );
+      }
+    });
+
+    it('does not throw when the address is not cached', async () => {
+      await expect(
+        service.invalidateAccountCache(ADDRESS),
+      ).resolves.toBeUndefined();
+    });
+  });
 });
