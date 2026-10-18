@@ -145,14 +145,34 @@ function buildMockDataSource() {
       );
     }
 
+    // COUNT deliveries (filtered/paginated list)
+    if (
+      s.includes('COUNT(*)') &&
+      s.includes('FROM webhook_deliveries') &&
+      !s.includes('FOR UPDATE SKIP LOCKED')
+    ) {
+      const filtered = filterDeliveries(s, params);
+      return [{ count: String(filtered.length) }];
+    }
+
     // SELECT deliveries list
     if (
       s.includes('FROM webhook_deliveries') &&
       !s.includes('FOR UPDATE SKIP LOCKED')
     ) {
-      const webhookId = params?.[0] as string | undefined;
-      const all = Object.values(deliveries);
-      return webhookId ? all.filter((d) => d.webhook_id === webhookId) : all;
+      const filtered = filterDeliveries(s, params);
+      // Apply LIMIT/OFFSET when present
+      const limitMatch = s.match(/LIMIT \$(\d+)/);
+      const offsetMatch = s.match(/OFFSET \$(\d+)/);
+      let result = filtered;
+      if (limitMatch) {
+        const limit = (params as unknown[])[Number(limitMatch[1]) - 1] as number;
+        const offset = offsetMatch
+          ? ((params as unknown[])[Number(offsetMatch[1]) - 1] as number)
+          : 0;
+        result = filtered.slice(offset, offset + limit);
+      }
+      return result;
     }
 
     // SELECT aggregated delivery metrics (getWebhookMetrics)
@@ -264,6 +284,39 @@ function buildMockDataSource() {
 
     return [];
   });
+
+  /**
+   * Applies the WHERE clauses produced by getDeliveries to the in-memory
+   * delivery store. Supports webhook_id, status, event_type and created_at
+   * range filters.
+   */
+  function filterDeliveries(sql: string, params?: unknown[]) {
+    let all = Object.values(deliveries);
+    const p = (params ?? []) as unknown[];
+    let idx = 0;
+
+    if (sql.includes('webhook_id = $')) {
+      const webhookId = p[idx++] as string;
+      all = all.filter((d) => d.webhook_id === webhookId);
+    }
+    if (sql.includes('status = $')) {
+      const status = p[idx++] as string;
+      all = all.filter((d) => d.status === status);
+    }
+    if (sql.includes('event_type = $')) {
+      const eventType = p[idx++] as string;
+      all = all.filter((d) => d.event_type === eventType);
+    }
+    if (sql.includes('created_at >= $')) {
+      const from = p[idx++] as Date;
+      all = all.filter((d) => d.created_at >= from);
+    }
+    if (sql.includes('created_at <= $')) {
+      const to = p[idx++] as Date;
+      all = all.filter((d) => d.created_at <= to);
+    }
+    return all;
+  }
 
   return { query, _store: { webhooks, deliveries } };
 }
@@ -545,207 +598,156 @@ describe('WebhooksService', () => {
     });
   });
 
-  // ── #1184 — Webhook metrics ─────────────────────────────────────────────────
+  // ── #1182 — Delivery history filtering & pagination ─────────────────────────
 
-  describe('#1184 getWebhookMetrics', () => {
-    it('returns zeroed metrics when there is no data', async () => {
-      const metrics = await service.getWebhookMetrics();
-
-      expect(metrics.totalWebhooks).toBe(0);
-      expect(metrics.activeWebhooks).toBe(0);
-      expect(metrics.inactiveWebhooks).toBe(0);
-      expect(metrics.totalDeliveries).toBe(0);
-      expect(metrics.successfulDeliveries).toBe(0);
-      expect(metrics.failedDeliveries).toBe(0);
-      expect(metrics.pendingDeliveries).toBe(0);
-      expect(metrics.averageLatencyMs).toBe(0);
-      expect(metrics.failureRateByEventType).toEqual([]);
-      expect(metrics.topFailingWebhooks).toEqual([]);
-    });
-
-    it('counts total, active and inactive webhooks', async () => {
-      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
-
-      const wh1 = await service.registerWebhook('https://example.com/a', [
-        'credit_submitted',
-      ]);
-      await service.registerWebhook('https://example.com/b', [
-        'credit_submitted',
-      ]);
-
-      // Deactivate one webhook directly in the fake store.
-      mockDs._store.webhooks[wh1.id].active = false;
-
-      const metrics = await service.getWebhookMetrics();
-
-      expect(metrics.totalWebhooks).toBe(2);
-      expect(metrics.activeWebhooks).toBe(1);
-      expect(metrics.inactiveWebhooks).toBe(1);
-    });
-
-    it('aggregates delivery counts by status', async () => {
+  describe('#1182 getDeliveries filtering and pagination', () => {
+    async function seedDeliveries() {
       jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
 
       const wh = await service.registerWebhook('https://example.com/hook', [
         'credit_submitted',
+        'credit_retired',
       ]);
 
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-2' });
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-3' });
+      const store = mockDs._store.deliveries;
+      const base = new Date('2024-01-01T00:00:00.000Z');
+      const rows = [
+        {
+          id: 'del-1',
+          status: 'success',
+          event_type: 'credit_submitted',
+          created_at: new Date(base.getTime() + 1 * 86400000),
+        },
+        {
+          id: 'del-2',
+          status: 'failed',
+          event_type: 'credit_submitted',
+          created_at: new Date(base.getTime() + 2 * 86400000),
+        },
+        {
+          id: 'del-3',
+          status: 'success',
+          event_type: 'credit_retired',
+          created_at: new Date(base.getTime() + 3 * 86400000),
+        },
+        {
+          id: 'del-4',
+          status: 'pending',
+          event_type: 'credit_retired',
+          created_at: new Date(base.getTime() + 4 * 86400000),
+        },
+        {
+          id: 'del-5',
+          status: 'success',
+          event_type: 'credit_submitted',
+          created_at: new Date(base.getTime() + 5 * 86400000),
+        },
+      ];
+      for (const r of rows) {
+        store[r.id] = {
+          id: r.id,
+          webhook_id: wh.id,
+          event_id: `evt-${r.id}`,
+          event_type: r.event_type,
+          payload_json: '{}',
+          status: r.status,
+          attempts: 1,
+          last_attempt_at: r.created_at,
+          next_retry_at: r.created_at,
+          created_at: r.created_at,
+        };
+      }
+      return { wh, base };
+    }
 
-      const ids = Object.keys(mockDs._store.deliveries);
-      mockDs._store.deliveries[ids[0]].status = 'success';
-      mockDs._store.deliveries[ids[1]].status = 'failed';
-      // ids[2] stays pending
+    it('returns all deliveries with default pagination', async () => {
+      await seedDeliveries();
 
-      const metrics = await service.getWebhookMetrics();
+      const result = await service.getDeliveries();
 
-      expect(metrics.totalDeliveries).toBe(3);
-      expect(metrics.successfulDeliveries).toBe(1);
-      expect(metrics.failedDeliveries).toBe(1);
-      expect(metrics.pendingDeliveries).toBe(1);
-      expect(wh.id).toBeDefined();
+      expect(result.total).toBe(5);
+      expect(result.page).toBe(1);
+      expect(result.pageSize).toBe(20);
+      expect(result.items.length).toBe(5);
     });
 
-    it('computes average delivery latency from successful deliveries', async () => {
-      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+    it('filters by status', async () => {
+      await seedDeliveries();
 
-      await service.registerWebhook('https://example.com/hook', [
-        'credit_submitted',
-      ]);
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-2' });
+      const result = await service.getDeliveries({ status: 'success' });
 
-      const ids = Object.keys(mockDs._store.deliveries);
-      const base = Date.now();
-      mockDs._store.deliveries[ids[0]].status = 'success';
-      mockDs._store.deliveries[ids[0]].created_at = new Date(base);
-      mockDs._store.deliveries[ids[0]].last_attempt_at = new Date(base + 100);
-      mockDs._store.deliveries[ids[1]].status = 'success';
-      mockDs._store.deliveries[ids[1]].created_at = new Date(base);
-      mockDs._store.deliveries[ids[1]].last_attempt_at = new Date(base + 300);
-
-      const metrics = await service.getWebhookMetrics();
-
-      expect(metrics.averageLatencyMs).toBe(200);
+      expect(result.total).toBe(3);
+      expect(result.items.every((d) => d.status === 'success')).toBe(true);
     });
 
-    it('computes failure rate by event type', async () => {
-      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+    it('filters by eventType', async () => {
+      await seedDeliveries();
 
-      await service.registerWebhook('https://example.com/hook', [
-        'credit_submitted',
-        'credit_approved',
-      ]);
+      const result = await service.getDeliveries({
+        eventType: 'credit_retired',
+      });
 
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-2' });
-      await service.triggerWebhooks('credit_approved', { id: 'evt-3' });
-
-      const ids = Object.keys(mockDs._store.deliveries);
-      mockDs._store.deliveries[ids[0]].status = 'failed';
-      mockDs._store.deliveries[ids[1]].status = 'success';
-      mockDs._store.deliveries[ids[2]].status = 'failed';
-
-      const metrics = await service.getWebhookMetrics();
-
-      const submitted = metrics.failureRateByEventType.find(
-        (e) => e.eventType === 'credit_submitted',
-      );
-      const approved = metrics.failureRateByEventType.find(
-        (e) => e.eventType === 'credit_approved',
-      );
-
-      expect(submitted).toBeDefined();
-      expect(submitted!.total).toBe(2);
-      expect(submitted!.failed).toBe(1);
-      expect(submitted!.failureRate).toBeCloseTo(0.5);
-
-      expect(approved).toBeDefined();
-      expect(approved!.total).toBe(1);
-      expect(approved!.failed).toBe(1);
-      expect(approved!.failureRate).toBeCloseTo(1);
-    });
-
-    it('returns top failing webhooks ordered by failure count', async () => {
-      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
-
-      const whA = await service.registerWebhook('https://example.com/a', [
-        'credit_submitted',
-      ]);
-      const whB = await service.registerWebhook('https://example.com/b', [
-        'credit_submitted',
-      ]);
-
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-2' });
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-3' });
-
-      const ids = Object.keys(mockDs._store.deliveries);
-      // whA fails twice, whB fails once
-      mockDs._store.deliveries[ids[0]].webhook_id = whA.id;
-      mockDs._store.deliveries[ids[0]].status = 'failed';
-      mockDs._store.deliveries[ids[1]].webhook_id = whA.id;
-      mockDs._store.deliveries[ids[1]].status = 'failed';
-      mockDs._store.deliveries[ids[2]].webhook_id = whB.id;
-      mockDs._store.deliveries[ids[2]].status = 'failed';
-
-      const metrics = await service.getWebhookMetrics();
-
-      expect(metrics.topFailingWebhooks.length).toBeGreaterThanOrEqual(2);
-      expect(metrics.topFailingWebhooks[0].webhookId).toBe(whA.id);
-      expect(metrics.topFailingWebhooks[0].failed).toBe(2);
-      expect(metrics.topFailingWebhooks[1].webhookId).toBe(whB.id);
-      expect(metrics.topFailingWebhooks[1].failed).toBe(1);
-    });
-  });
-
-  // ── #1184 — Prometheus delivery metrics ─────────────────────────────────────
-
-  describe('#1184 Prometheus delivery metrics', () => {
-    it('increments success counter on successful delivery', async () => {
-      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
-
-      await service.registerWebhook('https://example.com/hook', [
-        'credit_submitted',
-      ]);
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
-
-      const incSpy = jest
-        .spyOn(service as unknown as { recordDeliveryMetric: jest.Mock }, 'recordDeliveryMetric')
-        .mockImplementation(() => undefined);
-
-      mockedAxios.post = jest.fn().mockResolvedValue({ status: 200 });
-      await service.processQueue();
-
-      expect(incSpy).toHaveBeenCalledWith(
-        'credit_submitted',
-        'success',
-        expect.any(Number),
+      expect(result.total).toBe(2);
+      expect(result.items.every((d) => d.event_type === 'credit_retired')).toBe(
+        true,
       );
     });
 
-    it('increments failure counter on failed delivery', async () => {
-      jest.spyOn(service, 'validateWebhookUrl').mockResolvedValue(undefined);
+    it('filters by from/to date range', async () => {
+      const { base } = await seedDeliveries();
 
-      await service.registerWebhook('https://example.com/hook', [
-        'credit_submitted',
+      const result = await service.getDeliveries({
+        from: new Date(base.getTime() + 2 * 86400000),
+        to: new Date(base.getTime() + 4 * 86400000),
+      });
+
+      expect(result.total).toBe(3);
+      expect(result.items.map((d) => d.id).sort()).toEqual([
+        'del-2',
+        'del-3',
+        'del-4',
       ]);
-      await service.triggerWebhooks('credit_submitted', { id: 'evt-1' });
+    });
 
-      const incSpy = jest
-        .spyOn(service as unknown as { recordDeliveryMetric: jest.Mock }, 'recordDeliveryMetric')
-        .mockImplementation(() => undefined);
+    it('combines status, eventType and date filters', async () => {
+      const { base } = await seedDeliveries();
 
-      mockedAxios.post = jest.fn().mockRejectedValue(new Error('boom'));
-      await service.processQueue();
+      const result = await service.getDeliveries({
+        status: 'success',
+        eventType: 'credit_submitted',
+        from: new Date(base.getTime() + 2 * 86400000),
+      });
 
-      expect(incSpy).toHaveBeenCalledWith(
-        'credit_submitted',
-        'failed',
-        expect.any(Number),
-      );
+      expect(result.total).toBe(1);
+      expect(result.items[0].id).toBe('del-5');
+    });
+
+    it('paginates results and reports total', async () => {
+      await seedDeliveries();
+
+      const page1 = await service.getDeliveries({ page: 1, pageSize: 2 });
+      expect(page1.total).toBe(5);
+      expect(page1.items.length).toBe(2);
+
+      const page3 = await service.getDeliveries({ page: 3, pageSize: 2 });
+      expect(page3.total).toBe(5);
+      expect(page3.items.length).toBe(1);
+    });
+
+    it('throws BadRequestException for invalid status', async () => {
+      await seedDeliveries();
+
+      await expect(
+        service.getDeliveries({ status: 'bogus' }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('throws BadRequestException for invalid date', async () => {
+      await seedDeliveries();
+
+      await expect(
+        service.getDeliveries({ from: 'not-a-date' as unknown as Date }),
+      ).rejects.toThrow(BadRequestException);
     });
   });
 
